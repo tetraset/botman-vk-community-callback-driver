@@ -70,7 +70,6 @@ use BotMan\Drivers\VK\Extensions\VKKeyboardButton;
 use BotMan\Drivers\VK\Extensions\VKKeyboardRow;
 use CURLFile;
 use Illuminate\Support\Collection;
-use Mimey\MimeTypes;
 use Symfony\Component\HttpFoundation\ParameterBag;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -86,14 +85,14 @@ class VkCommunityCallbackDriver extends HttpDriver {
      *
      * @var array
      */
-    protected $messages;
+    private $messages;
 
     /**
      * IP-address of client
      *
      * @var string
      */
-    protected $ip;
+    private $ip;
 
     /**
      * Peer ID (user or conversation ID)
@@ -101,7 +100,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
      *
      * @var string
      */
-    protected $peer_id;
+    private $peer_id;
 
     /**
      * Incoming message from user/conversation
@@ -112,12 +111,12 @@ class VkCommunityCallbackDriver extends HttpDriver {
     /**
      * @var bool
      */
-    protected $reply = false;
+    private $reply = false;
 
     /**
      * @var VKEvent
      */
-    protected $driverEvent;
+    private $driverEvent;
 
 
     /**
@@ -150,7 +149,15 @@ class VkCommunityCallbackDriver extends HttpDriver {
             ignore_user_abort(true);
             ob_start();
 
+
+
             switch($this->payload->get("type")){
+                // Echo the confirmation token
+                // [DEPRECATED] Use $botman->on("confirmation", function($payload, Botman $bot){ echo("token"); }); in routes/botman.php instead
+                case "confirmation":
+//                    $this->echoConfirmationToken();
+                    break;
+
                 // Echo OK for all incoming events
                 default:
                     $this->ok();
@@ -172,7 +179,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
     /**
      * @var bool
      */
-    protected $ok = false;
+    private $ok = false;
 
     /**
      * Echos 'ok'
@@ -201,13 +208,15 @@ class VkCommunityCallbackDriver extends HttpDriver {
      * @throws VKDriverException
      */
     public function matchesRequest() {
-        //TODO: anything else?
-        //TODO: verification via implementing VerifiesService's verifyRequest() method
-
         $check = !is_null($this->payload->get("secret")) &&
             $this->payload->get("secret") == $this->config->get("secret") &&
             !is_null($this->payload->get("group_id")) &&
             $this->payload->get("group_id") == $this->config->get("group_id");
+
+        // Avoid answering to own messages
+        if ($this->payload->get("object") !== null && isset($this->payload->get("object")["from_id"])) {
+            $check = $this->config->get("group_id") !== ltrim($this->payload->get("object")["from_id"], "-");
+        }
 
         // Stop performing the request if errors
         if($check) $this->configurationCheckUp();
@@ -274,34 +283,17 @@ class VkCommunityCallbackDriver extends HttpDriver {
      * @param $message_object
      * @return IncomingMessage
      */
-    protected function serializeIncomingMessage($message, $sender, $recipient, $message_object) {
+    private function serializeIncomingMessage($message, $sender, $recipient, $message_object) {
         $attachments = [];
         $collection = Collection::make($message_object["attachments"]);
 
         // Getting photos
         (($_ = $collection->where('type', 'photo')->pluck('photo')->map(function ($item) {
-                // Search for corrupted array info
-                if(in_array(null, [
-                        $item["album_id"], $item["date"], $item["id"], $item["owner_id"], $item["sizes"]
-                    ]) || $item["sizes"] == [])
-                    return false;
-
                 // Pick the best photo (with high resolution)
-                $found = Collection::make($item["sizes"])->sort(function($a, $b){
-                    return $a["height"] * $a["width"] <=> $b["height"] * $b["width"];
-                })->last();
-
-                // Reject if corrupted image
-                if(
-                    $found["height"] <= 0 ||
-                    $found["width"] <= 0 ||
-                    $found["url"] == null ||
-                    trim($found["url"]) == ""
-                )
-                    return false;
+                $found = Collection::make($item["sizes"])->sortBy("height")->last();
 
                 return new Image($found['url'], $item);
-            })->reject(function($value){ return $value === false; })->toArray()) && count($_) > 0) ? ($attachments["photos"] = $_) : false;
+            })->toArray()) && count($_) > 0) ? ($attachments["photos"] = $_) : false;
 
         // Getting videos
         (($_ = $collection->where('type', 'video')->pluck('video')->map(function ($item) {
@@ -325,7 +317,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
 
 
         // Make an incoming message with no text if it is so
-        if(empty($message)){
+        if($message == ""){
             // Returning message with images only
             if(count($attachments) == 1 and isset($attachments["photos"])){
                 $result = new IncomingMessage(Image::PATTERN, $sender, $recipient, $this->payload);
@@ -389,9 +381,9 @@ class VkCommunityCallbackDriver extends HttpDriver {
      * @return bool
      */
     public function isConfigured() {
-        $anyExceptions = false;
 
-        try {
+        $anyExceptions = false;
+        try{
             $this->configurationCheckUp();
         } catch (VKDriverDeprecatedFeature $e){
             $anyExceptions = true;
@@ -399,7 +391,12 @@ class VkCommunityCallbackDriver extends HttpDriver {
             $anyExceptions = true;
         }
 
-        return !$anyExceptions;
+        return
+            !$anyExceptions; // &&
+//            !empty($this->config->get('secret')) &&
+//            !empty($this->config->get('token')) &&
+//            !empty($this->config->get('version')) &&
+//            version_compare($this->config->get('version'), "5.103", ">=");
     }
 
 
@@ -467,9 +464,10 @@ class VkCommunityCallbackDriver extends HttpDriver {
             switch ($this->driverEvent->getName()){
                 case "message_new":
                 case "message_edit":
-                case "message_reply":
                     return true;
-                    break;
+                case "message_reply":
+                    // Avoid answering to own messages
+                    return $this->config->get("group_id") !== ltrim($this->payload->get("object")["from_id"], "-");
             }
 
             // Return other events
@@ -796,7 +794,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
                 /** @var QuestionActionInterface[] $actions */
                 $actions = $message->getActions();
 
-                $inline = false; // Force the keyboard to be non-inline
+                $inline = true;
                 $one_time = true; // Force the keyboard to be shown once
 
                 $rows = Collection::make($actions)
@@ -886,12 +884,12 @@ class VkCommunityCallbackDriver extends HttpDriver {
      * @throws VKDriverException
      * @throws VKDriverException
      */
-    protected function prepareAttachments($matchingMessage, $attachment){
+    private function prepareAttachments($matchingMessage, $attachment){
         $ret = [];
         $peer_id = (!empty($matchingMessage->getRecipient())) ? $matchingMessage->getRecipient() : $matchingMessage->getSender();
 
         switch(get_class($attachment)){
-            case Image::class:
+            case "BotMan\BotMan\Messages\Attachments\Image":
                 /** @var $attachment Image */
 
                 // Just return already uploaded photo
@@ -900,7 +898,11 @@ class VkCommunityCallbackDriver extends HttpDriver {
                     break;
                 }
 
-                // Otherwise, upload image to VK
+                // Chekc if th image is gif animation
+                $pathParts = pathinfo($attachment->getUrl());
+                if ($pathParts['extension'] === 'gif') {
+                    return $this->prepareAttachments($matchingMessage, new File($attachment->getUrl()));
+                }
 
                 // Send typing status while uploading
                 $this->types($matchingMessage);
@@ -913,8 +915,8 @@ class VkCommunityCallbackDriver extends HttpDriver {
                 $uploadImg = $this->upload($getUploadUrl["response"]['upload_url'], $attachment->getUrl());
 
                 // If error
-                if(!isset($uploadImg["photo"]) || $uploadImg["photo"] == "[]")
-                    throw new VKDriverException("Can't upload image to VK. Please, be sure the photo has correct extension.");
+                if(empty($uploadImg["photo"]) || $uploadImg["photo"] == "[]")
+                    throw new VKDriverException("Can't upload image to VK: Response for image: " . print_r($uploadImg, true) . ', Response for up server: ' . print_r($getUploadUrl, true));
 
                 $saveImg = $this->api('photos.saveMessagesPhoto', [
                     'photo' => $uploadImg['photo'],
@@ -926,7 +928,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
 
                 break;
 
-            case Video::class:
+            case "BotMan\BotMan\Messages\Attachments\Video":
                 /** @var $attachment Video */
 
                 // Just return already uploaded video
@@ -939,7 +941,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
                 throw new VKDriverException("Uploading videos with community token is not supported by VK API (uploading with user token is under construction)");
                 break;
 
-            case Audio::class:
+            case "BotMan\BotMan\Messages\Attachments\Audio":
                 /** @var $attachment Audio */
 
                 // Just return already uploaded audio
@@ -964,9 +966,8 @@ class VkCommunityCallbackDriver extends HttpDriver {
                     $upload = $this->upload($getUpload["response"]['upload_url'], $attachment->getUrl());
 
                     // If error
-                    if(!isset($upload["file"]) || $upload["file"] == "[]" || $upload["file"] == "" || $upload["file"] == null) {
-                        throw new VKDriverException("Can't upload audio to VK. Please, be sure the audio has correct extension (OGG is preferred). Learn more: https://vk.com/dev/upload_files_2");
-                    }
+                    if(empty($upload) || $upload["file"] == "[]" || $upload["file"] == "" || $upload["file"] == null)
+                        throw new VKDriverException("Can't upload audio to VK. Please, be sure audo has correct extension (OGG is preferred). Learn more: https://vk.com/dev/upload_files_2");
 
                     $save = $this->api('docs.save', [
                         'file' => $upload['file']
@@ -981,7 +982,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
                 throw new VKDriverException("Uploading audio is restricted by VK API");
                 break;
 
-            case File::class:
+            case "BotMan\BotMan\Messages\Attachments\File":
                 /** @var $attachment File */
 
                 // Just return already uploaded document
@@ -1129,8 +1130,10 @@ class VkCommunityCallbackDriver extends HttpDriver {
     public function api($method, $post_data, $asArray = false)
     {
 
-        if(!isset($post_data["v"]))             $post_data["v"] = $this->config->get("version");
-        if(!isset($post_data["access_token"]))  $post_data["access_token"] = $this->config->get("token");
+        $post_data += [
+            "v" => $this->config->get("version"),
+            "access_token" => $this->config->get("token")
+        ];
 
         $response = $this->http->post($this->config->get("endpoint").$method, [], $post_data, [], false);
 
@@ -1161,32 +1164,30 @@ class VkCommunityCallbackDriver extends HttpDriver {
      */
     public function upload($url, $filename/*, $asArray = false*/)
     {
-        // Saving file to temp folder
-        $tempFileName = tempnam(sys_get_temp_dir(), self::DRIVER_NAME . '_');
-        file_put_contents($tempFileName, file_get_contents($filename));
-
-        // Rename with correct extension (required for uploading)
-        $ext = (new MimeTypes())
-            ->getExtension(mime_content_type($tempFileName));
-        rename($tempFileName, $tempFileName . "." . $ext);
-        $tempFileName = $tempFileName . "." . $ext;
-
-        // CURL post upload
+        // check if $filename is remote url, if so download remote file
+        if (filter_var($filename, FILTER_VALIDATE_URL)) {
+            $tmpFileName = sys_get_temp_dir() . '/' . basename($filename);
+            file_put_contents($tmpFileName, @fopen($filename, 'r') ?: file_get_contents($filename));
+            $filename = $tmpFileName;
+        }
         $curl = curl_init($url);
         curl_setopt($curl, CURLOPT_POST, true);
         curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($curl, CURLOPT_POSTFIELDS, [
-            'file' => new CURLfile($tempFileName)
-        ]);
-        $data = curl_exec($curl);
+        curl_setopt($curl, CURLOPT_POSTFIELDS, array('file' => new CURLfile($filename)));
+        $json = curl_exec($curl);
         curl_close($curl);
 
-        // Unlink temp file
-        unlink($tempFileName);
+        $data = json_decode($json, true);
 
-        //TODO: check for exceptions
+        if (isset($tmpFileName)) {
+            unlink($tmpFileName);
+        }
 
-        return json_decode($data, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new VKDriverException(\sprintf("Error in upload process: %s", $json));
+        }
+
+        return $data;
     }
 
     /**
@@ -1205,7 +1206,7 @@ class VkCommunityCallbackDriver extends HttpDriver {
      * @param Collection|ParameterBag $payload
      * @return false|array Private message (https://vk.com/dev/objects/message) as array or false
      */
-    protected function extractPrivateMessageFromPayload($payload)
+    private function extractPrivateMessageFromPayload($payload)
     {
         switch ($payload->get("type")) {
             case "message_new":
